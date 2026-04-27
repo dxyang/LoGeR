@@ -125,6 +125,8 @@ parser.add_argument("--canonical_first_frame", action="store_true", default=True
 parser.add_argument("--no_canonical_first_frame", action="store_false", dest='canonical_first_frame', help="Do not use first frame as canonical frame.")
 parser.add_argument("--warmup", action="store_true", help="Run a warmup inference pass to trigger torch.compile before timing.")
 parser.add_argument("--benchmark", action="store_true", help="Run multiple inference passes and report timing statistics.")
+parser.add_argument("--load_to_cpu", action="store_true", default=True, help="Keep the preloaded image tensor on CPU (default; avoids GPU OOM on long sequences).")
+parser.add_argument("--no_load_to_cpu", action="store_false", dest='load_to_cpu', help="Move the preloaded image tensor onto the GPU before inference.")
 
 def load_pi3_model(model_name: str, config_path: Optional[str] = None, pi3x: bool = False, pi3x_metric: bool = True):
     """Initializes the Pi3 model and loads weights."""
@@ -362,20 +364,13 @@ def write_trajectory_txt(output_path: Path, timestamps, translations, quaternion
 
 
 def load_images_from_paths(image_paths, PIXEL_LIMIT=255000, Target_W=None, Target_H=None, verbose=True):
-    sources = []
-    for img_path in image_paths:
-        try:
-            sources.append(Image.open(img_path).convert('RGB'))
-        except Exception as e:
-            print(f"Could not load image {img_path}: {e}")
-
-    if not sources:
+    if not image_paths:
         print("No images found or loaded.")
         return torch.empty(0)
 
     if Target_W is None and Target_H is None:
-        first_img = sources[0]
-        W_orig, H_orig = first_img.size
+        with Image.open(image_paths[0]) as first_img:
+            W_orig, H_orig = first_img.size
         scale = math.sqrt(PIXEL_LIMIT / (W_orig * H_orig)) if W_orig * H_orig > 0 else 1
         W_target, H_target = W_orig * scale, H_orig * scale
         k, m = round(W_target / 14), round(H_target / 14)
@@ -385,25 +380,26 @@ def load_images_from_paths(image_paths, PIXEL_LIMIT=255000, Target_W=None, Targe
         TARGET_W, TARGET_H = max(1, k) * 14, max(1, m) * 14
     else:
         TARGET_W, TARGET_H = Target_W, Target_H
-    
+
     if verbose:
         print(f"All images will be resized to a uniform size: ({TARGET_W}, {TARGET_H})")
 
-    tensor_list = []
+    out = torch.empty((len(image_paths), 3, TARGET_H, TARGET_W), dtype=torch.float32)
     to_tensor_transform = transforms.ToTensor()
-    
-    for img_pil in sources:
+
+    valid = 0
+    for img_path in image_paths:
         try:
-            resized_img = img_pil.resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
-            img_tensor = to_tensor_transform(resized_img)
-            tensor_list.append(img_tensor)
+            with Image.open(img_path) as img:
+                resized = img.convert('RGB').resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
+            out[valid].copy_(to_tensor_transform(resized))
+            valid += 1
         except Exception as e:
-            print(f"Error processing an image: {e}")
+            print(f"Could not load image {img_path}: {e}")
 
-    if not tensor_list:
+    if valid == 0:
         return torch.empty(0)
-
-    return torch.stack(tensor_list, dim=0)
+    return out[:valid] if valid < len(image_paths) else out
 
 def main():
     args = parser.parse_args()
@@ -501,10 +497,12 @@ def main():
             
         print(f"Found {len(all_image_names_collected)} images to process.")
         if target_resolution is not None:
-            images_tensor = load_images_from_paths(all_image_names_collected, Target_W=target_resolution[0], Target_H=target_resolution[1]).to(device)
+            images_tensor = load_images_from_paths(all_image_names_collected, Target_W=target_resolution[0], Target_H=target_resolution[1])
         else:
-            images_tensor = load_images_from_paths(all_image_names_collected).to(device)
-        
+            images_tensor = load_images_from_paths(all_image_names_collected)
+        if not args.load_to_cpu:
+            images_tensor = images_tensor.to(device)
+
         image_folder_for_sky = os.path.dirname(all_image_names_collected[0]) if all_image_names_collected else None
 
         if images_tensor.numel() == 0:
@@ -623,7 +621,7 @@ def main():
 
         # Post-process predictions
         # Using permute to get (B, S, H, W, C) for easier numpy conversion later
-        raw_model_predictions['images'] = images_tensor[None].permute(0, 1, 3, 4, 2) 
+        raw_model_predictions['images'] = images_tensor[None].permute(0, 1, 3, 4, 2)
         raw_model_predictions['conf'] = torch.sigmoid(raw_model_predictions['conf'])
         # Edge mask on depth can be noisy, optional
         # edge = depth_edge(raw_model_predictions['local_points'][..., 2], rtol=0.03)

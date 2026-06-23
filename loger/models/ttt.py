@@ -116,53 +116,66 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
         w0_now, w1_now, w2_now = w0, w1, w2
 
         if update:
-            ki, vi = k[:, start:end, :], v[:, start:end, :]  # bf16 [b, l, d]
-            
-            lr0i = lr0[:, start:end, :]  # [b, l, d/1] fp32
-            lr1i = lr1[:, start:end, :]  # [b, l, d/1] fp32
-            lr2i = lr2[:, start:end, :]  # [b, l, d/1] fp32
+            # This branch computes the self-supervised fast-weight update used as
+            # *next window's* starting state -- callers only ever need its value,
+            # never its gradient (it's read-then-detached by every caller, including
+            # the outer nav-TTT loop). It also shares inputs with (but is otherwise
+            # independent of) the `apply` branch below, which IS differentiated when
+            # an outer loop needs gradients into w0/w1/w2. Without this no_grad, an
+            # input w0/w1/w2 with requires_grad=True forces autograd to retain every
+            # intermediate here too -- several (l, d_h)-sized tensors plus
+            # muon_update_steps rounds of Newton-Schulz iteration, per TTT layer --
+            # even though nothing downstream ever backprops through them. Wrapping
+            # just this branch in no_grad is a pure memory optimization: same
+            # values, no change to the apply branch's gradient.
+            with torch.no_grad():
+                ki, vi = k[:, start:end, :], v[:, start:end, :]  # bf16 [b, l, d]
 
-            gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-            hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-            hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
+                lr0i = lr0[:, start:end, :]  # [b, l, d/1] fp32
+                lr1i = lr1[:, start:end, :]  # [b, l, d/1] fp32
+                lr2i = lr2[:, start:end, :]  # [b, l, d/1] fp32
 
-            for _ in range(ttt_update_steps):
-                # Fixed objective: neg_dot_product (gradient ascent)
-                dhidden = vi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
-                dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
-                dgate = dhidden * hidden_before_mul
-                dgate_before_act = silu_backprop(dgate, gate_before_act)
+                gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+                hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+                hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
 
-                w1_grad = zeropower_via_newtonschulz5(
-                    (hidden * lr1i).transpose(-1, -2) @ vi, muon_update_steps
-                )
-                w0_grad = zeropower_via_newtonschulz5(
-                    (ki * lr0i).transpose(-1, -2) @ dgate_before_act, muon_update_steps
-                )
-                w2_grad = zeropower_via_newtonschulz5(
-                    (ki * lr2i).transpose(-1, -2) @ dhidden_before_mul, muon_update_steps
-                )
+                for _ in range(ttt_update_steps):
+                    # Fixed objective: neg_dot_product (gradient ascent)
+                    dhidden = vi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
+                    dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
+                    dgate = dhidden * hidden_before_mul
+                    dgate_before_act = silu_backprop(dgate, gate_before_act)
 
-                if momentum is not None:
-                    m_i = momentum[:, start:end, :].mean(dim=1, keepdim=True)
-                    w0_grad = w0_grad + dw0_momentum * m_i
-                    w1_grad = w1_grad + dw1_momentum * m_i
-                    w2_grad = w2_grad + dw2_momentum * m_i
-                    dw0_momentum = w0_grad
-                    dw1_momentum = w1_grad
-                    dw2_momentum = w2_grad
-                
-                # Gradient ascent: add gradients
-                w1_now = w1_now + w1_grad
-                w0_now = w0_now + w0_grad
-                w2_now = w2_now + w2_grad
+                    w1_grad = zeropower_via_newtonschulz5(
+                        (hidden * lr1i).transpose(-1, -2) @ vi, muon_update_steps
+                    )
+                    w0_grad = zeropower_via_newtonschulz5(
+                        (ki * lr0i).transpose(-1, -2) @ dgate_before_act, muon_update_steps
+                    )
+                    w2_grad = zeropower_via_newtonschulz5(
+                        (ki * lr2i).transpose(-1, -2) @ dhidden_before_mul, muon_update_steps
+                    )
 
-                # do weight norm here
-                w0_now = w0_now / (w0_now.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
-                w1_now = w1_now / (w1_now.norm(dim=1, keepdim=True) + 1e-5) * w1_norm
-                w2_now = w2_now / (w2_now.norm(dim=1, keepdim=True) + 1e-5) * w2_norm
+                    if momentum is not None:
+                        m_i = momentum[:, start:end, :].mean(dim=1, keepdim=True)
+                        w0_grad = w0_grad + dw0_momentum * m_i
+                        w1_grad = w1_grad + dw1_momentum * m_i
+                        w2_grad = w2_grad + dw2_momentum * m_i
+                        dw0_momentum = w0_grad
+                        dw1_momentum = w1_grad
+                        dw2_momentum = w2_grad
 
-            w0, w1, w2 = w0_now, w1_now, w2_now
+                    # Gradient ascent: add gradients
+                    w1_now = w1_now + w1_grad
+                    w0_now = w0_now + w0_grad
+                    w2_now = w2_now + w2_grad
+
+                    # do weight norm here
+                    w0_now = w0_now / (w0_now.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
+                    w1_now = w1_now / (w1_now.norm(dim=1, keepdim=True) + 1e-5) * w1_norm
+                    w2_now = w2_now / (w2_now.norm(dim=1, keepdim=True) + 1e-5) * w2_norm
+
+                w0, w1, w2 = w0_now, w1_now, w2_now
 
         if apply:
             # Only calculate the output in the last repeat.

@@ -591,6 +591,18 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         turn_off_ttt = kwargs.pop('turn_off_ttt', False)
         turn_off_swa = kwargs.pop('turn_off_swa', False)
         sim3_scale_mode = kwargs.pop('sim3_scale_mode', 'median')
+        # Optional hooks for outer-loop TTT adaptation (e.g. nav-consistency losses).
+        # before_window_hook(window_idx, start_idx, end_idx, w0, w1, w2) -> (w0, w1, w2)
+        #   called right before this window is encoded/decoded; lets a caller swap in
+        #   tensors with requires_grad_(True) to later backprop into.
+        # after_window_hook(window_idx, start_idx, end_idx, pred_dict, w0, w1, w2) -> (w0, w1, w2)
+        #   called right after this window's pred_dict (incl. camera_poses, still
+        #   differentiable w.r.t. whatever before_window_hook returned) is built; lets
+        #   a caller compute a loss, backprop, and return a corrected state to carry
+        #   into the next window. w0/w1/w2 here are the self-supervised TTT update's
+        #   output (next window's default starting state), NOT connected to pred_dict.
+        before_window_hook = kwargs.pop('before_window_hook', None)
+        after_window_hook = kwargs.pop('after_window_hook', None)
 
         if sim3 and se3:
             raise ValueError("'sim3' and 'se3' alignments are mutually exclusive; enable only one.")
@@ -667,6 +679,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         for window_idx, (start_idx, end_idx) in enumerate(windows_iter):
             if reset_every > 0 and window_idx > 0 and window_idx % reset_every == 0:
                 reset_adaptive_states()
+            if before_window_hook is not None:
+                w0, w1, w2 = before_window_hook(window_idx, start_idx, end_idx, w0, w1, w2)
             imgs_w = imgs[:, start_idx:end_idx]  # (B, Nw, C, H, W)
             imgs_w = imgs_w.to(self.image_mean.device)
             imgs_w = (imgs_w - self.image_mean) / self.image_std
@@ -822,7 +836,23 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 local_camera_qvec=maybe_detach(local_camera_qvec, no_detach=no_detach),
                 metric=maybe_detach(metric, no_detach=no_detach),
             )
+            if after_window_hook is not None:
+                w0, w1, w2 = after_window_hook(window_idx, start_idx, end_idx, pred_dict, w0, w1, w2)
             all_predictions.append(pred_dict)
+            # Drop references to this window's heavy intermediates now that pred_dict
+            # (detached, if no_detach=True callers want to keep it differentiable
+            # outside this loop, e.g. via a hook above) has been recorded. Without
+            # this, these locals stay live -- and so does this window's full backward
+            # graph when no_detach=True -- until next iteration's reassignment
+            # completes, meaning two windows' graphs are alive simultaneously during
+            # most of the next window's forward pass. With requires_grad-tracked TTT
+            # fast weights (Newton-Schulz/Muon iterations retained for backward),
+            # that overlap is the difference between fitting on a 48GB GPU and not.
+            hidden = pos = ttt_output_info = None
+            point_hidden = conf_hidden = metric_hidden = camera_hidden = global_camera_hidden = None
+            local_points = conf = camera_poses = points = metric = None
+            camera_qvec = local_camera_poses = local_camera_qvec = None
+            xy = z = ret = None  # intermediate point_head outputs (assignment is safe even if unbound)
 
         # Merge windowed predictions
         # When reset is enabled but explicit Sim3/SE3 alignment is off, keep each reset block

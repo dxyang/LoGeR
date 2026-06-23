@@ -21,6 +21,7 @@ from loger.utils.geometry import depth_edge
 from loger.models.pi3 import Pi3
 from loger.utils.viser_utils import viser_wrapper
 
+import tqdm
 
 # Helper function to check if a path is a video file
 def is_video_file(path):
@@ -58,7 +59,7 @@ def extract_frames_from_video(video_path, output_dir, start_frame, end_frame, st
             cv2.imwrite(frame_path, frame)
             image_paths.append(frame_path)
             saved_frame_count += 1
-        
+
         current_frame_idx += 1
 
     cap.release()
@@ -138,7 +139,7 @@ def load_pi3_model(model_name: str, config_path: Optional[str] = None, pi3x: boo
         try:
             with open(config_path, 'r') as f:
                 config = yaml.safe_load(f)
-            
+
             model_config = config.get('model', {})
             pi3_signature = inspect.signature(Pi3.__init__)
             valid_kwargs = {
@@ -193,7 +194,7 @@ def load_pi3_model(model_name: str, config_path: Optional[str] = None, pi3x: boo
             model = model.from_pretrained(model_name, strict=False if pi3x else True, **model_kwargs)
             print("Model loaded successfully from Hugging Face Hub.")
             return model
-        
+
         # Load pre-trained weights
         print(f"Loading pre-trained weights from: {model_name}")
         # Use strict=False to allow for architecture mismatches when loading weights
@@ -212,14 +213,14 @@ def load_pi3_model(model_name: str, config_path: Optional[str] = None, pi3x: boo
                 new_state_dict[k[7:]] = v  # remove `module.`
             else:
                 new_state_dict[k] = v
-        
+
         model.load_state_dict(new_state_dict, strict=True)
-        
+
         print("Model loaded successfully.")
     except Exception as e:
         print(f"Could not load model. Error: {e}")
         return None
-        
+
     return model
 
 
@@ -237,16 +238,16 @@ def run_core_inference(
     """
     model_obj.eval()
     model_obj = model_obj.to(device)
-    
+
     temp_frame_dirs = {}
     input_indices = {}
     all_image_names = []
-    
+
     for i, input_path in enumerate(input_paths):
         input_key = f"input{i+1}"
         if i > 0:
             input_indices[f"cam{i:02d}"] = len(all_image_names)
-        
+
         if is_video_file(input_path):
             temp_dir = tempfile.mkdtemp(prefix=f"pi3_frames_{input_key}_")
             temp_frame_dirs[input_key] = temp_dir
@@ -270,18 +271,18 @@ def run_core_inference(
     if not all_image_names:
         print("Error: No images found from any input.")
         return None, [], {}, {}
-        
+
     print(f"Loading images from combined inputs ({len(all_image_names)} images found)...")
     # Use load_images_from_paths to load exactly the images we collected
     images_tensor = load_images_from_paths(all_image_names, Target_W=target_resolution[0], Target_H=target_resolution[1]).to(device)
     print(f"Preprocessed images tensor shape: {images_tensor.shape}")
 
-    print("Running inference...")    
+    print("Running inference...")
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
 
     with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
         raw_model_predictions = model_obj(images_tensor[None]) # Add batch dimension
-    
+
     # Post-process predictions
     raw_model_predictions['images'] = images_tensor[None].permute(0, 1, 3, 4, 2) # B, S, H, W, C
     raw_model_predictions['conf'] = torch.sigmoid(raw_model_predictions['conf'])
@@ -388,7 +389,7 @@ def load_images_from_paths(image_paths, PIXEL_LIMIT=255000, Target_W=None, Targe
     to_tensor_transform = transforms.ToTensor()
 
     valid = 0
-    for img_path in image_paths:
+    for img_path in tqdm.tqdm(image_paths):
         try:
             with Image.open(img_path) as img:
                 resized = img.convert('RGB').resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
@@ -417,7 +418,7 @@ def main():
     input_indices = {}
     image_folder_for_sky = None
     target_resolution = args.resolution if args.resolution and len(args.resolution) == 2 else None
-    
+
     # Generate seq_name automatically if not provided, similar to demo_viser.py
     if args.seq_name is None:
         args.seq_name = os.path.basename(os.path.dirname(args.input)) + "_" + os.path.basename(args.input)
@@ -429,7 +430,7 @@ def main():
             args.seq_name += f"_{os.path.basename(os.path.dirname(args.input4))}_{os.path.basename(args.input4)}"
         if args.input5:
             args.seq_name += f"_{os.path.basename(os.path.dirname(args.input5))}_{os.path.basename(args.input5)}"
-    
+
     if args.load:
         saved_predictions_path = args.load
         if os.path.isdir(saved_predictions_path):
@@ -437,7 +438,7 @@ def main():
                 saved_predictions_path = os.path.join(saved_predictions_path, f"{args.seq_name}.pt")
             else:
                 saved_predictions_path = os.path.join(saved_predictions_path, "predictions.pt")
-        
+
         if os.path.exists(saved_predictions_path):
             print(f"Loading pre-computed results from {saved_predictions_path}...")
             try:
@@ -454,7 +455,7 @@ def main():
                 image_folder_for_sky = args.input # Assume first input is the reference for sky mask
             except Exception as e:
                 print(f"Error loading {saved_predictions_path}: {e}. Proceeding with inference.")
-                predictions_dict = None 
+                predictions_dict = None
         else:
             print(f"No pre-computed results found at {saved_predictions_path}. Proceeding with inference.")
 
@@ -470,10 +471,10 @@ def main():
         model = model.eval()
 
         input_paths = [p for p in [args.input, args.input2, args.input3, args.input4, args.input5] if p is not None]
-        
+
         all_image_names_collected = []
         input_indices = {}
-        
+
         for i, input_path in enumerate(input_paths):
             if i > 0: input_indices[f"cam{i:02d}"] = len(all_image_names_collected)
 
@@ -490,11 +491,11 @@ def main():
                 end_idx = args.end_frame if args.end_frame != -1 else None
                 current_frames = current_frames[args.start_frame:end_idx:args.stride]
                 all_image_names_collected.extend(current_frames)
-        
+
         if not all_image_names_collected:
             print("No images to process. Exiting.")
             return
-            
+
         print(f"Found {len(all_image_names_collected)} images to process.")
         if target_resolution is not None:
             images_tensor = load_images_from_paths(all_image_names_collected, Target_W=target_resolution[0], Target_H=target_resolution[1])
@@ -512,7 +513,7 @@ def main():
         print("Running inference...")
         dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
         num_frames = images_tensor.shape[0]
-        
+
         forward_kwargs = {}
         if args.config:
             try:
@@ -577,12 +578,12 @@ def main():
                 t_end = time.time()
                 inference_times.append(t_end - t_start)
                 print(f"  Run {run_idx + 1}/{num_runs}: {t_end - t_start:.3f}s")
-            
+
             avg_time = sum(inference_times) / len(inference_times)
             min_time = min(inference_times)
             max_time = max(inference_times)
             std_time = (sum((t - avg_time) ** 2 for t in inference_times) / len(inference_times)) ** 0.5
-            
+
             print(f"\n{'='*50}")
             print(f"Benchmark Results ({num_runs} runs):")
             print(f"  Total frames: {num_frames}")
@@ -597,14 +598,14 @@ def main():
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             inference_start_time = time.time()
-            
+
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
                 raw_model_predictions = model(images_tensor[None], **forward_kwargs) # Add batch dimension
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             inference_end_time = time.time()
-            
+
             # Calculate and display timing
             inference_time = inference_end_time - inference_start_time
             fps = num_frames / inference_time
@@ -631,21 +632,21 @@ def main():
 
         # Convert all tensors to numpy and remove batch dimension
         # Filter out non-tensor values (e.g., window_ttt_losses which is a list)
-        predictions_dict = {k: v.squeeze(0).cpu().float().numpy() 
-                           for k, v in raw_model_predictions.items() 
+        predictions_dict = {k: v.squeeze(0).cpu().float().numpy()
+                           for k, v in raw_model_predictions.items()
                            if v is not None and torch.is_tensor(v)}
 
         if args.output_folder:
             os.makedirs(args.output_folder, exist_ok=True)
             # Use the same naming convention as demo_viser.py
             seq_name_to_use = f"{args.seq_name}_{str(args.start_frame)}_{str(args.end_frame)}_{str(args.stride)}"
-            
+
             # Count number of inputs processed
             input_paths = [p for p in [args.input, args.input2, args.input3, args.input4, args.input5] if p is not None]
             num_inputs_processed = len(input_paths)
             if num_inputs_processed > 1:
                 seq_name_to_use += f"_x{num_inputs_processed}"
-            
+
             output_filename = f"{seq_name_to_use}.pt" if seq_name_to_use else "predictions.pt"
             output_path = os.path.join(args.output_folder, output_filename)
             print(f"Saving inference results to {output_path}...")
@@ -670,19 +671,19 @@ def main():
             # If we pass the original input path as input_rgb_dir, it might work if filenames match.
             # But filenames in temp dir are frame_xxxxxx.png.
             # So we should probably use the original filenames if possible, or just fallback to indices if using temp dir.
-            
+
             # If we used temp dir (which we did for combined inputs), filenames are frame_000000.png.
             # This breaks mapping to rgb.txt which uses original filenames.
             # So for now, if we used temp dir, we might have to fallback to indices unless we tracked original names.
-            # In run_core_inference or main, we didn't track original names in a way that maps easily back for rgb.txt lookup 
+            # In run_core_inference or main, we didn't track original names in a way that maps easily back for rgb.txt lookup
             # unless we parse them.
-            
-            # However, if args.input is a directory and we are just processing it (and maybe others), 
+
+            # However, if args.input is a directory and we are just processing it (and maybe others),
             # and if we want to evaluate, we usually care about the timestamps of the frames we processed.
-            
-            # Let's try to use indices as timestamps if we can't easily map back, 
+
+            # Let's try to use indices as timestamps if we can't easily map back,
             # OR if the user provided a single input folder, we can try to be smarter.
-            
+
             timestamps = None
             if len(input_paths) == 1 and os.path.isdir(args.input) and not is_video_file(args.input):
                  # If single folder input, we can try to load timestamps using the original filenames
@@ -693,7 +694,7 @@ def main():
                  current_frames = [f for f in current_frames if "depth" not in os.path.basename(f).lower()]
                  end_idx = args.end_frame if args.end_frame != -1 else None
                  current_frames = current_frames[args.start_frame:end_idx:args.stride]
-                 
+
                  timestamps = _try_load_timestamps_for_images(current_frames, Path(args.input))
             else:
                  # Fallback to indices
@@ -702,14 +703,14 @@ def main():
             # 2) Extract poses
             # predictions_dict['camera_poses'] is (N, 4, 4) numpy array
             camera_poses = torch.from_numpy(predictions_dict['camera_poses'])
-            
+
             # Pi3 outputs Twc (Camera to World) directly
             Twc = camera_poses
             Rwc = Twc[..., :3, :3]
             twc = Twc[..., :3, 3]
-            
+
             qwc = mat_to_quat(Rwc) # XYZW
-            
+
             # 3) Write
             # Ensure lengths match
             S = min(len(timestamps), twc.shape[0], qwc.shape[0])
@@ -730,18 +731,18 @@ def main():
 
     print("Starting viser visualization...")
     viser_wrapper(
-        predictions_dict, 
+        predictions_dict,
         port=args.port,
         init_conf_threshold=args.conf_threshold,
         background_mode=args.background_mode,
         mask_sky=args.mask_sky,
-        image_folder_for_sky_mask=image_folder_for_sky, 
+        image_folder_for_sky_mask=image_folder_for_sky,
         subsample=args.subsample,
         video_width=args.video_width,
         share=args.share,
         canonical_first_frame=args.canonical_first_frame,
     )
-    
+
     for temp_dir_path in temp_frame_dirs.values():
         if os.path.exists(temp_dir_path):
             print(f"Cleaning up temporary directory: {temp_dir_path}")

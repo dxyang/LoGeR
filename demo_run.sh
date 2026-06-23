@@ -12,7 +12,7 @@ if [ -n "$CUDA_DEVICE" ]; then
 fi
 
 # choose from LoGeR, LoGeR_star
-ckpt_list=( 
+ckpt_list=(
     "LoGeR"
     "LoGeR_star"
 )
@@ -31,13 +31,13 @@ for ckpt_name in "${ckpt_list[@]}"; do
         --config "$config_path" \
         --model_name "$model_path" \
         --start_frame 0 \
-        --end_frame 50 \
+        --end_frame 3000 \
         --stride 1 \
         --window_size 32 \
         --overlap_size 3 \
         --subsample 2 \
         --share \
-        # --reset_every 5  # turned on for extreme long sequences (>1k frames)
+        --reset_every 5  # turned on for extreme long sequences (>1k frames)
 
 
     echo "--- Finished processing $ckpt_name ---"
